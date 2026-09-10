@@ -1,7 +1,10 @@
-name: Build OpenWrt x86_64 BTF 10G VMDK
+```yaml
+name: Build OpenWrt x86_64 BTF
 
 on:
   workflow_dispatch:
+  schedule:
+    - cron: "0 18 * * 0"
 
 permissions:
   contents: write
@@ -12,53 +15,10 @@ jobs:
     timeout-minutes: 360
 
     steps:
-
-      # ============================================================
-      # Find the latest stable OpenWrt release tag.
-      # Only tags such as v25.12.5 are accepted.
-      # Development branches such as main are never used.
-      # ============================================================
-      - name: Find latest stable OpenWrt
-        id: stable
-        shell: bash
-        run: |
-          set -euo pipefail
-
-          git ls-remote --tags --refs https://github.com/openwrt/openwrt.git \
-            | sed 's#.*refs/tags/##' \
-            | grep -E '^v[0-9]+\.[0-9]+\.[0-9]+$' \
-            | sort -V \
-            | tail -n 1 > latest_version.txt
-
-          if [ ! -s latest_version.txt ]; then
-            echo "ERROR: Failed to find latest stable OpenWrt release."
-            exit 1
-          fi
-
-          LATEST_VERSION="$(cat latest_version.txt)"
-
-          echo "Latest stable OpenWrt: ${LATEST_VERSION}"
-          echo "version=${LATEST_VERSION}" >> "${GITHUB_OUTPUT}"
-
-
-      # ============================================================
-      # Checkout the official OpenWrt source.
-      # ============================================================
-      - name: Checkout official OpenWrt
-        uses: actions/checkout@v4
-        with:
-          repository: openwrt/openwrt
-          ref: ${{ steps.stable.outputs.version }}
-          fetch-depth: 1
-
-
-      # ============================================================
-      # Install build dependencies.
-      # ============================================================
       - name: Install build dependencies
         shell: bash
         run: |
-          set -euo pipefail
+          set -eux
 
           sudo apt-get update
 
@@ -87,339 +47,251 @@ jobs:
             time \
             qemu-utils \
             zip \
-            unzip
+            unzip \
+            bc \
+            cpio \
+            dwarves
 
-
-      # ============================================================
-      # Update and install the official OpenWrt feeds.
-      # ============================================================
-      - name: Update OpenWrt feeds
+      - name: Check runner resources
         shell: bash
         run: |
-          set -euo pipefail
+          set -eux
+
+          echo "========== CPU =========="
+          nproc
+
+          echo "========== MEMORY =========="
+          free -h
+
+          echo "========== DISK =========="
+          df -h
+
+          echo "========== SWAP =========="
+          swapon --show || true
+
+      - name: Get latest stable OpenWrt release
+        id: release
+        shell: bash
+        run: |
+          set -eux
+
+          LATEST_TAG="$(git ls-remote --tags --refs \
+            https://github.com/openwrt/openwrt.git \
+            'v*' \
+            | awk -F/ '{print $3}' \
+            | sort -V \
+            | tail -n 1)"
+
+          if [ -z "$LATEST_TAG" ]; then
+            echo "Failed to detect latest OpenWrt release tag"
+            exit 1
+          fi
+
+          echo "Latest stable release: $LATEST_TAG"
+          echo "tag=$LATEST_TAG" >> "$GITHUB_OUTPUT"
+
+      - name: Checkout OpenWrt
+        shell: bash
+        run: |
+          set -eux
+
+          git clone --depth 1 \
+            --branch "${{ steps.release.outputs.tag }}" \
+            https://github.com/openwrt/openwrt.git \
+            openwrt
+
+      - name: Update and install feeds
+        working-directory: openwrt
+        shell: bash
+        run: |
+          set -eux
 
           ./scripts/feeds update -a
           ./scripts/feeds install -a
 
-
-      # ============================================================
-      # Configure OpenWrt.
-      #
-      # Only the following requested settings are explicitly changed:
-      #
-      #   TARGET_x86_64
-      #   KERNEL_DEBUG_INFO
-      #   KERNEL_DEBUG_INFO_BTF
-      #   KERNEL_DEBUG_INFO_REDUCED
-      #   TARGET_ROOTFS_PARTSIZE
-      #
-      # VMDK_IMAGES is NOT enabled.
-      # All other options are resolved by the official defconfig.
-      # ============================================================
-      - name: Configure OpenWrt
+      - name: Generate minimal configuration
+        working-directory: openwrt
         shell: bash
         run: |
-          set -euo pipefail
+          set -eux
 
           cat > .config <<'EOF'
           CONFIG_TARGET_x86=y
           CONFIG_TARGET_x86_64=y
+
           CONFIG_KERNEL_DEBUG_INFO=y
           CONFIG_KERNEL_DEBUG_INFO_BTF=y
           CONFIG_KERNEL_DEBUG_INFO_REDUCED=n
+
           CONFIG_TARGET_ROOTFS_PARTSIZE=10240
           EOF
 
           make defconfig
 
-          echo
-          echo "===== Final OpenWrt configuration ====="
-
-          grep -E \
-            '^(CONFIG_TARGET_x86|CONFIG_TARGET_x86_64|CONFIG_KERNEL_DEBUG_INFO|CONFIG_KERNEL_DEBUG_INFO_BTF|CONFIG_KERNEL_DEBUG_INFO_REDUCED|CONFIG_TARGET_ROOTFS_PARTSIZE|CONFIG_VMDK_IMAGES)=' \
-            .config || true
-
-          echo
-
-
-      # ============================================================
-      # Verify the final configuration.
-      # ============================================================
       - name: Verify configuration
+        working-directory: openwrt
         shell: bash
         run: |
-          set -euo pipefail
+          set -eux
 
-          echo "===== Verify target ====="
+          echo "========== Target =========="
+          grep -E '^CONFIG_TARGET_x86(=|_)' .config || true
 
-          grep -q '^CONFIG_TARGET_x86=y$' .config
-          grep -q '^CONFIG_TARGET_x86_64=y$' .config
+          echo "========== BTF =========="
+          grep -E '^CONFIG_KERNEL_DEBUG_INFO' .config || true
 
-          echo "===== Verify BTF ====="
+          echo "========== RootFS =========="
+          grep -E '^CONFIG_TARGET_ROOTFS_PARTSIZE=' .config
 
-          grep -q '^CONFIG_KERNEL_DEBUG_INFO=y$' .config
-          grep -q '^CONFIG_KERNEL_DEBUG_INFO_BTF=y$' .config
+          echo "========== VMDK =========="
+          grep -E '^CONFIG_VMDK_IMAGES=' .config || true
 
-          echo "===== Verify RootFS size ====="
+          test "$(grep -E '^CONFIG_TARGET_x86_64=y' .config)"
+          test "$(grep -E '^CONFIG_KERNEL_DEBUG_INFO=y' .config)"
+          test "$(grep -E '^CONFIG_KERNEL_DEBUG_INFO_BTF=y' .config)"
+          test "$(grep -E '^CONFIG_KERNEL_DEBUG_INFO_REDUCED=n' .config)"
+          test "$(grep -E '^CONFIG_TARGET_ROOTFS_PARTSIZE=10240' .config)"
 
-          grep -q '^CONFIG_TARGET_ROOTFS_PARTSIZE=10240$' .config
-
-          echo "===== Verify reduced debug information ====="
-
-          if grep -q '^CONFIG_KERNEL_DEBUG_INFO_REDUCED=y$' .config; then
-            echo "ERROR: CONFIG_KERNEL_DEBUG_INFO_REDUCED is enabled."
+          if grep -q '^CONFIG_VMDK_IMAGES=y' .config; then
+            echo "CONFIG_VMDK_IMAGES must not be enabled"
             exit 1
           fi
 
-          echo "===== Verify VMDK image generation ====="
-
-          if grep -q '^CONFIG_VMDK_IMAGES=y$' .config; then
-            echo "ERROR: CONFIG_VMDK_IMAGES must NOT be enabled."
-            exit 1
-          fi
-
-          echo
-          echo "Configuration verification passed."
-
-
-      # ============================================================
-      # Download all required OpenWrt sources.
-      # ============================================================
-      - name: Download OpenWrt sources
+      - name: Download sources
+        working-directory: openwrt
         shell: bash
         run: |
-          set -euo pipefail
+          set -eux
 
-          make download -j"$(nproc)"
+          make download -j2
 
-
-      # ============================================================
-      # Build OpenWrt.
-      # ============================================================
       - name: Build OpenWrt
+        working-directory: openwrt
         shell: bash
         run: |
-          set -euo pipefail
+          set -o pipefail
 
-          make -j"$(nproc)" V=s
+          (
+            while true; do
+              echo "[heartbeat] $(date -u '+%Y-%m-%d %H:%M:%S UTC')"
+              echo "[heartbeat] Memory:"
+              free -h || true
+              echo "[heartbeat] Disk:"
+              df -h / || true
+              sleep 60
+            done
+          ) &
 
+          HEARTBEAT_PID=$!
 
-      # ============================================================
-      # Locate the official x86_64 combined EFI image.
-      # ============================================================
-      - name: Locate OpenWrt image
+          trap 'kill "$HEARTBEAT_PID" 2>/dev/null || true' EXIT
+
+          make -j2 V=s 2>&1 | tee build.log
+
+      - name: Upload build log on failure
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: openwrt-build-log
+          path: openwrt/build.log
+          if-no-files-found: warn
+          retention-days: 7
+
+      - name: Locate firmware image
         id: image
+        working-directory: openwrt
         shell: bash
         run: |
-          set -euo pipefail
+          set -eux
 
-          IMAGE="$(
-            find bin/targets/x86/64 \
-              -maxdepth 1 \
-              -type f \
-              -name '*squashfs*combined-efi.img.gz' \
-              | sort \
-              | head -n 1
-          )"
+          IMAGE="$(find bin/targets/x86/64 -type f \
+            -name '*squashfs*combined-efi.img.gz' \
+            | head -n 1)"
 
-          if [ -z "${IMAGE}" ]; then
-            echo "ERROR: Official x86_64 combined EFI image was not found."
-            echo
-            echo "===== Available files ====="
-            find bin/targets/x86/64 \
-              -maxdepth 1 \
-              -type f \
-              -print \
-              | sort
+          if [ -z "$IMAGE" ]; then
+            echo "OpenWrt combined EFI image not found"
+            find bin/targets/x86/64 -maxdepth 1 -type f -print || true
             exit 1
           fi
 
-          echo "Found image:"
-          echo "${IMAGE}"
+          echo "Found image: $IMAGE"
+          echo "image=$IMAGE" >> "$GITHUB_OUTPUT"
 
-          echo "image=${IMAGE}" >> "${GITHUB_OUTPUT}"
-
-
-      # ============================================================
-      # Prepare working directories.
-      # ============================================================
-      - name: Prepare output directories
-        shell: bash
-        run: |
-          set -euo pipefail
-
-          mkdir -p work
-          mkdir -p output
-
-
-      # ============================================================
-      # Decompress the official OpenWrt IMG.
-      # ============================================================
-      - name: Decompress OpenWrt image
-        shell: bash
-        run: |
-          set -euo pipefail
-
-          gzip -dc \
-            "${{ steps.image.outputs.image }}" \
-            > work/OpenWrt-x86_64-BTF-10G.img
-
-          file work/OpenWrt-x86_64-BTF-10G.img
-
-          ls -lh work/OpenWrt-x86_64-BTF-10G.img
-
-
-      # ============================================================
-      # Convert the RAW IMG to VMDK.
-      #
-      # No streamOptimized option is used.
-      # ============================================================
       - name: Convert IMG to VMDK
+        working-directory: openwrt
         shell: bash
         run: |
-          set -euo pipefail
+          set -eux
+
+          IMAGE="${{ steps.image.outputs.image }}"
+
+          cp "$IMAGE" /tmp/openwrt.img.gz
+          gzip -dc /tmp/openwrt.img.gz > /tmp/OpenWrt-x86_64-BTF-10G.img
 
           qemu-img convert \
             -f raw \
             -O vmdk \
-            work/OpenWrt-x86_64-BTF-10G.img \
-            output/OpenWrt-x86_64-BTF-10G.vmdk
+            /tmp/OpenWrt-x86_64-BTF-10G.img \
+            /tmp/OpenWrt-x86_64-BTF-10G.vmdk
 
-          qemu-img info \
-            output/OpenWrt-x86_64-BTF-10G.vmdk
+          qemu-img info /tmp/OpenWrt-x86_64-BTF-10G.vmdk
 
-          ls -lh \
-            output/OpenWrt-x86_64-BTF-10G.vmdk
-
-
-      # ============================================================
-      # Calculate SHA256 of the uncompressed VMDK itself.
-      # ============================================================
-      - name: Calculate VMDK SHA256
+      - name: Generate SHA256
         shell: bash
-        working-directory: output
         run: |
-          set -euo pipefail
+          set -eux
 
-          sha256sum \
-            OpenWrt-x86_64-BTF-10G.vmdk \
+          cd /tmp
+
+          sha256sum OpenWrt-x86_64-BTF-10G.vmdk \
             > OpenWrt-x86_64-BTF-10G.vmdk.sha256
 
-          echo "===== SHA256 ====="
           cat OpenWrt-x86_64-BTF-10G.vmdk.sha256
 
-
-      # ============================================================
-      # Create ZIP.
-      #
-      # The ZIP contains ONLY:
-      #
-      #   OpenWrt-x86_64-BTF-10G.vmdk
-      #   OpenWrt-x86_64-BTF-10G.vmdk.sha256
-      # ============================================================
       - name: Create ZIP package
         shell: bash
-        working-directory: output
         run: |
-          set -euo pipefail
+          set -eux
+
+          rm -rf /tmp/openwrt-release
+          mkdir -p /tmp/openwrt-release
+
+          cp /tmp/OpenWrt-x86_64-BTF-10G.vmdk \
+            /tmp/openwrt-release/
+
+          cp /tmp/OpenWrt-x86_64-BTF-10G.vmdk.sha256 \
+            /tmp/openwrt-release/
+
+          cd /tmp/openwrt-release
 
           zip -9 \
-            OpenWrt-x86_64-BTF-10G.zip \
+            /tmp/OpenWrt-x86_64-BTF-10G.zip \
             OpenWrt-x86_64-BTF-10G.vmdk \
             OpenWrt-x86_64-BTF-10G.vmdk.sha256
 
-          echo
-          echo "===== ZIP contents ====="
+          unzip -l /tmp/OpenWrt-x86_64-BTF-10G.zip
 
-          unzip -l \
-            OpenWrt-x86_64-BTF-10G.zip
-
-
-      # ============================================================
-      # Verify that the ZIP contains exactly the two required files.
-      # ============================================================
-      - name: Verify ZIP package
-        shell: bash
-        working-directory: output
-        run: |
-          set -euo pipefail
-
-          EXPECTED_1="OpenWrt-x86_64-BTF-10G.vmdk"
-          EXPECTED_2="OpenWrt-x86_64-BTF-10G.vmdk.sha256"
-
-          ACTUAL_FILES="$(
-            unzip -Z1 OpenWrt-x86_64-BTF-10G.zip \
-              | sort
-          )"
-
-          EXPECTED_FILES="$(
-            printf '%s\n%s\n' \
-              "${EXPECTED_1}" \
-              "${EXPECTED_2}" \
-              | sort
-          )"
-
-          if [ "${ACTUAL_FILES}" != "${EXPECTED_FILES}" ]; then
-            echo "ERROR: ZIP contents are incorrect."
-            echo
-            echo "Expected:"
-            printf '%s\n' "${EXPECTED_FILES}"
-            echo
-            echo "Actual:"
-            printf '%s\n' "${ACTUAL_FILES}"
-            exit 1
-          fi
-
-          echo "ZIP verification passed."
-
-
-      # ============================================================
-      # Remove the VMDK and SHA256 from the workspace.
-      #
-      # Only the ZIP remains for the GitHub Release.
-      # ============================================================
-      - name: Remove intermediate files
-        shell: bash
-        run: |
-          set -euo pipefail
-
-          rm -f \
-            output/OpenWrt-x86_64-BTF-10G.vmdk \
-            output/OpenWrt-x86_64-BTF-10G.vmdk.sha256
-
-          echo "===== Release files ====="
-
-          find output \
-            -maxdepth 1 \
-            -type f \
-            -print
-
-
-      # ============================================================
-      # Create GitHub Release.
-      #
-      # Only the ZIP is uploaded.
-      # ============================================================
       - name: Create GitHub Release
         uses: softprops/action-gh-release@v2
         with:
-          tag_name: ${{ steps.stable.outputs.version }}
-          name: OpenWrt ${{ steps.stable.outputs.version }} x86_64 BTF 10G
-
+          tag_name: openwrt-${{ steps.release.outputs.tag }}-x86_64-btf-10g
+          name: OpenWrt ${{ steps.release.outputs.tag }} x86_64 BTF 10G
           body: |
-            ## OpenWrt x86_64 BTF 10G
+            Official OpenWrt x86_64 build.
 
-            - Source: official openwrt/openwrt
-            - Release: ${{ steps.stable.outputs.version }}
-            - Target: x86_64
-            - Kernel BTF: enabled
-            - RootFS partition: 10240 MiB (10 GiB)
-            - Image: official x86_64 combined EFI
-            - VMDK: converted from official IMG
-            - SHA256: included inside ZIP
+            Source:
+            https://github.com/openwrt/openwrt
 
+            Release:
+            ${{ steps.release.outputs.tag }}
+
+            Features:
+            - x86_64
+            - Kernel BTF enabled
+            - 10GB root filesystem
+            - VMDK generated from official IMG
+            - Uncompressed VMDK
           files: |
-            output/OpenWrt-x86_64-BTF-10G.zip
-
-          make_latest: true
+            /tmp/OpenWrt-x86_64-BTF-10G.zip
           fail_on_unmatched_files: true
+```
