@@ -11,17 +11,35 @@
 # 7. 计算 VMDK SHA256
 # 8. VMDK + SHA256 压缩成 ZIP
 # 9. GitHub Release 只上传 ZIP
+#
+# 不使用：
+# - OpenWrt main 开发分支
+# - 第三方 BTF 内核
+# - ImmortalWrt
+# - kenzok8/vmlinux-btf
+# - VMDK_IMAGES
 # ============================================================
 
 name: Build OpenWrt x86_64 BTF 10G VMDK
 
+# ============================================================
 # 手动运行
+# ============================================================
+
 on:
   workflow_dispatch:
 
-# GitHub Release 所需权限
+# ============================================================
+# GitHub Actions 权限
+# 用于创建 Release
+# ============================================================
+
 permissions:
   contents: write
+
+# ============================================================
+# Jobs
+# ============================================================
 
 jobs:
   build:
@@ -32,6 +50,18 @@ jobs:
 
       # ======================================================
       # 1. 获取最新稳定版 OpenWrt
+      #
+      # 只匹配：
+      # v数字.数字.数字
+      #
+      # 例如：
+      # v25.12.5
+      #
+      # 不匹配：
+      # main
+      # snapshot
+      # rc
+      # beta
       # ======================================================
 
       - name: Find latest stable OpenWrt
@@ -40,21 +70,21 @@ jobs:
         run: |
           set -euo pipefail
 
-          LATEST_VERSION="$(
-            git ls-remote --tags --refs https://github.com/openwrt/openwrt.git \
+          git ls-remote --tags --refs https://github.com/openwrt/openwrt.git \
             | sed 's#.*refs/tags/##' \
             | grep -E '^v[0-9]+\.[0-9]+\.[0-9]+$' \
             | sort -V \
-            | tail -n 1
-          )
+            | tail -n 1 > latest_version.txt
 
-          if [ -z "$LATEST_VERSION" ]; then
+          if [ ! -s latest_version.txt ]; then
             echo "Failed to find latest stable OpenWrt version."
             exit 1
           fi
 
-          echo "Latest stable OpenWrt: $LATEST_VERSION"
-          echo "version=$LATEST_VERSION" >> "$GITHUB_OUTPUT"
+          LATEST_VERSION=$(cat latest_version.txt)
+
+          echo "Latest stable OpenWrt: ${LATEST_VERSION}"
+          echo "version=${LATEST_VERSION}" >> "${GITHUB_OUTPUT}"
 
 
       # ======================================================
@@ -71,6 +101,9 @@ jobs:
 
       # ======================================================
       # 3. 安装编译依赖
+      #
+      # 这些只是 GitHub Runner 的编译工具。
+      # 不会作为额外功能加入 OpenWrt 固件。
       # ======================================================
 
       - name: Install build dependencies
@@ -107,7 +140,7 @@ jobs:
 
 
       # ======================================================
-      # 4. 更新官方 feeds
+      # 4. 更新 OpenWrt 官方 feeds
       # ======================================================
 
       - name: Update feeds
@@ -120,9 +153,9 @@ jobs:
 
 
       # ======================================================
-      # 5. 选择官方 x86_64
+      # 5. 选择 x86_64
       #
-      # x86 没有额外 Device Profile
+      # x86 平台没有额外 Device Profile。
       # ======================================================
 
       - name: Select x86_64 target
@@ -136,15 +169,18 @@ jobs:
 
 
       # ======================================================
-      # 6. 仅开启 Kernel BTF
+      # 6. 开启 Kernel BTF
       #
-      # BTF 需要：
+      # BTF 官方 Kconfig 依赖：
+      #
       # KERNEL_DEBUG_INFO=y
       # KERNEL_DEBUG_INFO_BTF=y
       # KERNEL_DEBUG_INFO_REDUCED=n
+      #
+      # 只修改 BTF 所需要的配置。
       # ======================================================
 
-      - name: Enable BTF
+      - name: Enable Kernel BTF
         shell: bash
         run: |
           set -euo pipefail
@@ -158,10 +194,13 @@ jobs:
       # ======================================================
       # 7. RootFS 分区设置为 10 GiB
       #
+      # OpenWrt 单位为 MiB。
+      #
       # 10240 MiB = 10 GiB
       #
       # 注意：
-      # 这里是 RootFS 分区总大小，不是剩余可写空间。
+      # 这是 RootFS 分区总大小。
+      # 不是剩余可写空间正好 10 GiB。
       # ======================================================
 
       - name: Set RootFS partition size to 10 GiB
@@ -174,10 +213,10 @@ jobs:
 
 
       # ======================================================
-      # 8. 生成最终配置
+      # 8. 根据 Kconfig 生成最终配置
       # ======================================================
 
-      - name: Generate default configuration
+      - name: Generate final configuration
         shell: bash
         run: |
           set -euo pipefail
@@ -194,41 +233,84 @@ jobs:
         run: |
           set -euo pipefail
 
-          echo "===== Target ====="
+          echo "========================================"
+          echo "Target"
+          echo "========================================"
+
           grep -E '^CONFIG_TARGET_x86(_64)?=y$' .config || true
 
+
           echo
-          echo "===== BTF ====="
+          echo "========================================"
+          echo "Kernel BTF"
+          echo "========================================"
+
           grep -E '^CONFIG_KERNEL_DEBUG_INFO(_BTF|_REDUCED)?=' .config || true
 
+
           echo
-          echo "===== RootFS ====="
+          echo "========================================"
+          echo "RootFS"
+          echo "========================================"
+
           grep -E '^CONFIG_TARGET_ROOTFS_PARTSIZE=' .config || true
 
+
           echo
-          echo "===== VMDK_IMAGES ====="
+          echo "========================================"
+          echo "VMDK_IMAGES"
+          echo "========================================"
+
           grep -E '^CONFIG_VMDK_IMAGES=' .config || true
 
+
           echo
-          echo "===== Verification ====="
+          echo "========================================"
+          echo "Verification"
+          echo "========================================"
 
-          grep -q '^CONFIG_TARGET_x86=y$' .config
-          grep -q '^CONFIG_TARGET_x86_64=y$' .config
 
-          grep -q '^CONFIG_KERNEL_DEBUG_INFO=y$' .config
-          grep -q '^CONFIG_KERNEL_DEBUG_INFO_BTF=y$' .config
+          if ! grep -q '^CONFIG_TARGET_x86=y$' .config; then
+            echo "ERROR: CONFIG_TARGET_x86 is not enabled."
+            exit 1
+          fi
+
+
+          if ! grep -q '^CONFIG_TARGET_x86_64=y$' .config; then
+            echo "ERROR: CONFIG_TARGET_x86_64 is not enabled."
+            exit 1
+          fi
+
+
+          if ! grep -q '^CONFIG_KERNEL_DEBUG_INFO=y$' .config; then
+            echo "ERROR: CONFIG_KERNEL_DEBUG_INFO is not enabled."
+            exit 1
+          fi
+
+
+          if ! grep -q '^CONFIG_KERNEL_DEBUG_INFO_BTF=y$' .config; then
+            echo "ERROR: CONFIG_KERNEL_DEBUG_INFO_BTF is not enabled."
+            exit 1
+          fi
+
 
           if grep -q '^CONFIG_KERNEL_DEBUG_INFO_REDUCED=y$' .config; then
             echo "ERROR: CONFIG_KERNEL_DEBUG_INFO_REDUCED must be disabled."
             exit 1
           fi
 
-          grep -q '^CONFIG_TARGET_ROOTFS_PARTSIZE=10240$' .config
+
+          if ! grep -q '^CONFIG_TARGET_ROOTFS_PARTSIZE=10240$' .config; then
+            echo "ERROR: RootFS partition size is not 10240 MiB."
+            exit 1
+          fi
+
 
           if grep -q '^CONFIG_VMDK_IMAGES=y$' .config; then
             echo "ERROR: CONFIG_VMDK_IMAGES must remain disabled."
             exit 1
           fi
+
 
           echo
           echo "Configuration verification passed."
@@ -262,21 +344,19 @@ jobs:
       # 12. 查找官方 x86_64 EFI SquashFS 镜像
       # ======================================================
 
-      - name: Locate official x86_64 image
+      - name: Locate x86_64 image
         id: image
         shell: bash
         run: |
           set -euo pipefail
 
-          IMAGE="$(
-            find bin/targets/x86/64 \
-              -maxdepth 1 \
-              -type f \
-              -name '*squashfs*combined-efi.img.gz' \
-              | head -n 1
-          )
+          IMAGE=$(find bin/targets/x86/64 \
+            -maxdepth 1 \
+            -type f \
+            -name '*squashfs*combined-efi.img.gz' \
+            | head -n 1)
 
-          if [ -z "$IMAGE" ]; then
+          if [ -z "${IMAGE}" ]; then
             echo "OpenWrt x86_64 combined EFI image not found."
 
             echo
@@ -292,13 +372,13 @@ jobs:
           fi
 
           echo "Found image:"
-          echo "$IMAGE"
+          echo "${IMAGE}"
 
-          echo "image=$IMAGE" >> "$GITHUB_OUTPUT"
+          echo "image=${IMAGE}" >> "${GITHUB_OUTPUT}"
 
 
       # ======================================================
-      # 13. 解压 IMG
+      # 13. 解压官方 IMG
       # ======================================================
 
       - name: Extract raw IMG
@@ -309,12 +389,11 @@ jobs:
           mkdir -p work
           mkdir -p output
 
-          gzip -dc \
-            "${{ steps.image.outputs.image }}" \
+          gzip -dc "${{ steps.image.outputs.image }}" \
             > work/OpenWrt-x86_64-BTF-10G.img
 
           echo
-          echo "===== Raw IMG ====="
+          echo "Raw IMG:"
 
           ls -lh work/OpenWrt-x86_64-BTF-10G.img
 
@@ -322,8 +401,8 @@ jobs:
       # ======================================================
       # 14. IMG 转 VMDK
       #
-      # 使用标准 qemu-img 转换
-      # 不使用 streamOptimized
+      # 不使用 streamOptimized。
+      # 不使用 OpenWrt VMDK_IMAGES。
       # ======================================================
 
       - name: Convert IMG to VMDK
@@ -338,12 +417,12 @@ jobs:
             output/OpenWrt-x86_64-BTF-10G.vmdk
 
           echo
-          echo "===== VMDK ====="
+          echo "VMDK:"
 
           ls -lh output/OpenWrt-x86_64-BTF-10G.vmdk
 
           echo
-          echo "===== VMDK info ====="
+          echo "VMDK information:"
 
           qemu-img info output/OpenWrt-x86_64-BTF-10G.vmdk
 
@@ -351,7 +430,7 @@ jobs:
       # ======================================================
       # 15. 计算 VMDK SHA256
       #
-      # 计算的是原始 VMDK 文件
+      # 计算未压缩 VMDK 的 SHA256。
       # ======================================================
 
       - name: Generate VMDK SHA256
@@ -366,16 +445,21 @@ jobs:
             > OpenWrt-x86_64-BTF-10G.vmdk.sha256
 
           echo
-          echo "===== VMDK SHA256 ====="
+          echo "VMDK SHA256:"
 
           cat OpenWrt-x86_64-BTF-10G.vmdk.sha256
 
 
       # ======================================================
-      # 16. VMDK + SHA256 压缩成 ZIP
+      # 16. 压缩 VMDK + SHA256
+      #
+      # ZIP 中只有：
+      #
+      # OpenWrt-x86_64-BTF-10G.vmdk
+      # OpenWrt-x86_64-BTF-10G.vmdk.sha256
       # ======================================================
 
-      - name: Compress VMDK
+      - name: Create ZIP
         shell: bash
         run: |
           set -euo pipefail
@@ -388,7 +472,7 @@ jobs:
             OpenWrt-x86_64-BTF-10G.vmdk.sha256
 
           echo
-          echo "===== ZIP ====="
+          echo "ZIP:"
 
           ls -lh OpenWrt-x86_64-BTF-10G.zip
 
@@ -396,7 +480,7 @@ jobs:
       # ======================================================
       # 17. 删除中间文件
       #
-      # 最终只留下 ZIP
+      # Release 最终只上传 ZIP。
       # ======================================================
 
       - name: Remove intermediate files
@@ -410,7 +494,7 @@ jobs:
             output/OpenWrt-x86_64-BTF-10G.vmdk.sha256
 
           echo
-          echo "===== Remaining files ====="
+          echo "Remaining files:"
 
           find output \
             -maxdepth 1 \
@@ -421,7 +505,7 @@ jobs:
       # ======================================================
       # 18. 创建 GitHub Release
       #
-      # 只上传 ZIP
+      # 只上传 ZIP。
       # ======================================================
 
       - name: Create GitHub Release
@@ -437,9 +521,9 @@ jobs:
             - Target: x86_64
             - Kernel BTF: enabled
             - RootFS partition: 10240 MiB (10 GiB)
-            - Image: official x86_64 combined EFI image
+            - Image: official x86_64 combined EFI
             - VMDK: converted from official IMG
-            - SHA256: VMDK checksum included
+            - SHA256: included inside ZIP
 
           files: |
             output/OpenWrt-x86_64-BTF-10G.zip
