@@ -1,4 +1,3 @@
-```yaml
 # ============================================================
 # OpenWrt x86_64 BTF 自动构建
 #
@@ -590,5 +589,188 @@ jobs:
           # 不指定 streamOptimized。
           # 因此这里不是 VMware streamOptimized VMDK。
 
-          qe
-```
+          qemu-img convert \
+            -f raw \
+            -O vmdk \
+            release/OpenWrt-x86_64-BTF-10G.img \
+            release/OpenWrt-x86_64-BTF-10G.vmdk
+
+          # 删除中间 IMG
+          #
+          # 最终 Release 不需要它。
+
+          rm -f \
+            release/OpenWrt-x86_64-BTF-10G.img
+
+          echo "========== VMDK INFO =========="
+
+          qemu-img info \
+            release/OpenWrt-x86_64-BTF-10G.vmdk
+
+          echo "==============================="
+
+
+      # ======================================================
+      # 计算 VMDK SHA256
+      #
+      # 注意：
+      #
+      # SHA256 针对的是：
+      #
+      #   OpenWrt-x86_64-BTF-10G.vmdk
+      #
+      # 不是 ZIP。
+      #
+      # 也不是压缩包内部的其他文件。
+      # ======================================================
+
+      - name: Generate SHA256
+        working-directory: openwrt
+        shell: bash
+        run: |
+          set -e
+
+          cd release
+
+          sha256sum \
+            OpenWrt-x86_64-BTF-10G.vmdk \
+            > OpenWrt-x86_64-BTF-10G.vmdk.sha256
+
+          echo "========== SHA256 =========="
+
+          cat OpenWrt-x86_64-BTF-10G.vmdk.sha256
+
+          echo "============================"
+
+
+      # ======================================================
+      # 创建最终 ZIP
+      #
+      # ZIP 内严格只包含：
+      #
+      #   OpenWrt-x86_64-BTF-10G.vmdk
+      #   OpenWrt-x86_64-BTF-10G.vmdk.sha256
+      #
+      # 不放：
+      #   IMG
+      #   IMG.GZ
+      #   build.log
+      #   config
+      #   其他 OpenWrt 文件
+      # ======================================================
+
+      - name: Create ZIP package
+        working-directory: openwrt
+        shell: bash
+        run: |
+          set -e
+
+          cd release
+
+          zip -9 \
+            OpenWrt-x86_64-BTF-10G.zip \
+            OpenWrt-x86_64-BTF-10G.vmdk \
+            OpenWrt-x86_64-BTF-10G.vmdk.sha256
+
+          echo "========== ZIP CONTENTS =========="
+
+          unzip -l \
+            OpenWrt-x86_64-BTF-10G.zip
+
+          echo "=================================="
+
+
+      # ======================================================
+      # 显示最终 Release 目录
+      #
+      # 用于确认最终生成了哪些文件。
+      # ======================================================
+
+      - name: Show release files
+        working-directory: openwrt
+        shell: bash
+        run: |
+          set -e
+
+          echo "========== RELEASE FILES =========="
+
+          ls -lh release/
+
+          echo "==================================="
+
+
+      # ======================================================
+      # 构建失败时上传日志
+      #
+      # 方便排查：
+      #
+      #   build.log
+      #   download.log
+      #   .config
+      #   image.mk
+      #   编译输出目录
+      #
+      # 使用 upload-artifact@v5。
+      # ======================================================
+
+      - name: Upload logs on failure
+        if: failure()
+        uses: actions/upload-artifact@v5
+        with:
+          name: openwrt-build-logs
+
+          path: |
+            openwrt/build.log
+            openwrt/download.log
+            openwrt/.config
+            openwrt/include/image.mk
+            openwrt/bin/targets/x86/64/
+
+          if-no-files-found: warn
+          retention-days: 7
+
+
+      # ======================================================
+      # 创建 GitHub Release
+      #
+      # Release Tag：
+      #
+      #   v25.12.5-btf-10g
+      #
+      # Release 中只上传：
+      #
+      #   OpenWrt-x86_64-BTF-10G.zip
+      #
+      # ZIP 内才包含：
+      #
+      #   VMDK
+      #   SHA256
+      # ======================================================
+
+      - name: Create GitHub Release
+        if: success()
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ steps.release.outputs.version }}-btf-10g
+
+          name: OpenWrt ${{ steps.release.outputs.version }} x86_64 BTF 10G
+
+          body: |
+            OpenWrt official stable release
+
+            Version: ${{ steps.release.outputs.version }}
+
+            Architecture: x86_64
+
+            BTF: enabled
+
+            RootFS: 10GB
+
+            VMDK: converted from official combined-efi.img
+
+            VMDK_IMAGES: disabled
+
+            SHA256: included
+
+          files: |
+            openwrt/release/OpenWrt-x86_64-BTF-10G.zip
