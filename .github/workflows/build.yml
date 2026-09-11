@@ -1,20 +1,88 @@
 ```yaml
+# ============================================================
+# OpenWrt x86_64 BTF 自动构建
+#
+# 构建来源：
+#   官方 OpenWrt 仓库
+#   https://github.com/openwrt/openwrt
+#
+# 构建目标：
+#   x86_64
+#
+# 主要功能：
+#   1. 自动获取 OpenWrt 最新稳定版 Release
+#   2. 只启用官方 BTF 支持
+#   3. RootFS 分区大小设置为 10GB
+#   4. 不启用 OpenWrt 原生 VMDK_IMAGES
+#   5. 官方 combined-efi.img.gz 转换为 VMDK
+#   6. 不使用 streamOptimized
+#   7. 对未压缩 VMDK 本体计算 SHA256
+#   8. ZIP 只包含 VMDK 和 SHA256
+#   9. GitHub Release 只上传 ZIP
+#
+# 不使用：
+#   - main 分支
+#   - ImmortalWrt
+#   - kenzok8/vmlinux-btf
+#   - 第三方 BTF
+#   - 第三方 OpenWrt SDK
+#   - OpenWrt 原生 VMDK_IMAGES
+#
+# ============================================================
+
 name: Build OpenWrt x86_64 BTF
+
+
+# ============================================================
+# 触发方式
+#
+# workflow_dispatch：
+#   可以在 GitHub Actions 页面手动运行
+#
+# schedule：
+#   每周自动检查并构建最新稳定版
+# ============================================================
 
 on:
   workflow_dispatch:
+
   schedule:
     - cron: "0 2 * * 1"
 
+
+# ============================================================
+# GitHub Actions 权限
+#
+# contents: write
+#   用于创建 GitHub Release 并上传构建产物
+# ============================================================
+
 permissions:
   contents: write
+
+
+# ============================================================
+# Job
+# ============================================================
 
 jobs:
   build:
     runs-on: ubuntu-24.04
 
     steps:
+
+      # ======================================================
       # 安装 OpenWrt 官方编译所需依赖
+      #
+      # dwarves：
+      #   提供 pahole
+      #   OpenWrt BTF 构建需要使用它
+      #
+      # qemu-utils：
+      #   提供 qemu-img
+      #   用于将官方 IMG 转换为 VMDK
+      # ======================================================
+
       - name: Install build dependencies
         shell: bash
         run: |
@@ -50,14 +118,28 @@ jobs:
             unzip \
             dwarves
 
-          echo "========== 工具版本 =========="
+          echo "========== TOOL VERSIONS =========="
+
           gcc --version | head -n 1
           clang --version | head -n 1
           pahole --version
           qemu-img --version | head -n 1
-          echo "=============================="
 
+          echo "==================================="
+
+
+      # ======================================================
       # 获取 OpenWrt 官方最新稳定版 Release
+      #
+      # 使用 GitHub Releases API：
+      #
+      #   /repos/openwrt/openwrt/releases/latest
+      #
+      # 不直接使用 main
+      # 不从所有 tag 中自行排序
+      # 不使用第三方仓库
+      # ======================================================
+
       - name: Get latest OpenWrt stable release
         id: release
         shell: bash
@@ -69,26 +151,47 @@ jobs:
               -H "Accept: application/vnd.github+json" \
               https://api.github.com/repos/openwrt/openwrt/releases/latest \
             | python3 -c 'import json,sys; print(json.load(sys.stdin)["tag_name"])'
-          )"
+          )
 
           if [ -z "$VERSION" ]; then
-            echo "错误：无法获取 OpenWrt 最新稳定版"
+            echo "ERROR: Failed to get latest OpenWrt release"
             exit 1
           fi
+
+          # 确保获取到的是正式 Release Tag
+          # 例如：
+          #   v25.12.5
+          #
+          # 而不是：
+          #   main
+          #   rc
+          #   其他异常字符串
 
           case "$VERSION" in
             v[0-9]*)
               ;;
             *)
-              echo "错误：GitHub 返回的 Release Tag 不符合预期：$VERSION"
+              echo "ERROR: Invalid OpenWrt release tag: $VERSION"
               exit 1
               ;;
           esac
 
-          echo "OpenWrt 最新稳定版：$VERSION"
+          echo "Latest OpenWrt stable release: $VERSION"
+
           echo "version=$VERSION" >> "$GITHUB_OUTPUT"
 
+
+      # ======================================================
       # 下载 OpenWrt 官方 Release 源码
+      #
+      # 使用上一步获取的正式 Release Tag
+      #
+      # 例如：
+      #   v25.12.5
+      #
+      # 不使用 main
+      # ======================================================
+
       - name: Clone OpenWrt source
         shell: bash
         run: |
@@ -101,13 +204,25 @@ jobs:
 
           cd openwrt
 
-          echo "OpenWrt commit："
+          echo "========== OPENWRT SOURCE =========="
+
+          echo "OpenWrt commit:"
           git rev-parse HEAD
 
-          echo "OpenWrt tag："
+          echo "OpenWrt tag:"
           git describe --tags --always
 
+          echo "===================================="
+
+
+      # ======================================================
       # 更新并安装 OpenWrt 官方 feeds
+      #
+      # 这里使用 OpenWrt 自己的 feeds.conf.default
+      #
+      # 不加入任何第三方 feed
+      # ======================================================
+
       - name: Update OpenWrt feeds
         working-directory: openwrt
         shell: bash
@@ -117,7 +232,30 @@ jobs:
           ./scripts/feeds update -a
           ./scripts/feeds install -a
 
-      # 创建 x86_64 + BTF + 10GB RootFS 配置
+
+      # ======================================================
+      # 创建 OpenWrt 编译配置
+      #
+      # 目标：
+      #   x86_64
+      #
+      # BTF：
+      #   CONFIG_KERNEL_DEBUG_INFO=y
+      #   CONFIG_KERNEL_DEBUG_INFO_BTF=y
+      #
+      # 注意：
+      #   BTF 依赖完整 DWARF 信息
+      #   所以必须关闭：
+      #   CONFIG_KERNEL_DEBUG_INFO_REDUCED
+      #
+      # RootFS：
+      #   10240 MB = 10 GB
+      #
+      # VMDK：
+      #   不设置 CONFIG_VMDK_IMAGES
+      #   后续使用 qemu-img 单独转换
+      # ======================================================
+
       - name: Configure OpenWrt
         working-directory: openwrt
         shell: bash
@@ -135,70 +273,105 @@ jobs:
           CONFIG_TARGET_ROOTFS_PARTSIZE=10240
           EOF
 
+          # 根据当前 OpenWrt 官方源码处理依赖关系
           make defconfig
 
-          echo "========== 最终关键配置 =========="
+          echo "========== FINAL CONFIGURATION =========="
 
           grep -E \
             '^(CONFIG_TARGET_x86|CONFIG_TARGET_x86_64|CONFIG_KERNEL_DEBUG_INFO|CONFIG_KERNEL_DEBUG_INFO_BTF|CONFIG_KERNEL_DEBUG_INFO_BTF_MODULES|CONFIG_KERNEL_DEBUG_INFO_REDUCED|CONFIG_TARGET_ROOTFS_PARTSIZE|CONFIG_VMDK_IMAGES)' \
             .config || true
 
-          echo "==================================="
+          echo "========================================="
 
+
+      # ======================================================
       # 验证最终配置
+      #
+      # 这里不只是打印配置，而是主动检查。
+      #
+      # 如果 BTF / x86_64 / RootFS 配置不正确，
+      # 直接停止整个 Workflow。
+      # ======================================================
+
       - name: Verify configuration
         working-directory: openwrt
         shell: bash
         run: |
           set -e
 
-          echo "========== 验证配置 =========="
+          echo "========== VERIFY CONFIGURATION =========="
+
+          # x86 Target
 
           grep -q '^CONFIG_TARGET_x86=y$' .config || {
-            echo "错误：CONFIG_TARGET_x86 未启用"
+            echo "ERROR: CONFIG_TARGET_x86 is not enabled"
             exit 1
           }
+
+          # x86_64 Subtarget
 
           grep -q '^CONFIG_TARGET_x86_64=y$' .config || {
-            echo "错误：CONFIG_TARGET_x86_64 未启用"
+            echo "ERROR: CONFIG_TARGET_x86_64 is not enabled"
             exit 1
           }
+
+          # Kernel debug information
 
           grep -q '^CONFIG_KERNEL_DEBUG_INFO=y$' .config || {
-            echo "错误：CONFIG_KERNEL_DEBUG_INFO 未启用"
+            echo "ERROR: CONFIG_KERNEL_DEBUG_INFO is not enabled"
             exit 1
           }
+
+          # BTF
 
           grep -q '^CONFIG_KERNEL_DEBUG_INFO_BTF=y$' .config || {
-            echo "错误：CONFIG_KERNEL_DEBUG_INFO_BTF 未启用"
+            echo "ERROR: CONFIG_KERNEL_DEBUG_INFO_BTF is not enabled"
             exit 1
           }
+
+          # Reduced DWARF 必须关闭
 
           if grep -q '^CONFIG_KERNEL_DEBUG_INFO_REDUCED=y$' .config; then
-            echo "错误：CONFIG_KERNEL_DEBUG_INFO_REDUCED 被启用"
+            echo "ERROR: CONFIG_KERNEL_DEBUG_INFO_REDUCED is enabled"
             exit 1
           fi
 
+          # RootFS 必须为 10240 MB
+
           grep -q '^CONFIG_TARGET_ROOTFS_PARTSIZE=10240$' .config || {
-            echo "错误：CONFIG_TARGET_ROOTFS_PARTSIZE 不是 10240"
+            echo "ERROR: CONFIG_TARGET_ROOTFS_PARTSIZE is not 10240"
             exit 1
           }
 
+          # 不允许使用 OpenWrt 原生 VMDK_IMAGES
+
           if grep -q '^CONFIG_VMDK_IMAGES=y$' .config; then
-            echo "错误：CONFIG_VMDK_IMAGES 不应该启用"
+            echo "ERROR: CONFIG_VMDK_IMAGES must not be enabled"
             exit 1
           fi
 
-          echo "x86：通过"
-          echo "x86_64：通过"
-          echo "DEBUG_INFO：通过"
-          echo "BTF：通过"
-          echo "DEBUG_INFO_REDUCED：未启用"
-          echo "RootFS：10240 MB"
-          echo "VMDK_IMAGES：未启用"
-          echo "所有配置验证通过"
+          echo "x86: OK"
+          echo "x86_64: OK"
+          echo "DEBUG_INFO: OK"
+          echo "BTF: OK"
+          echo "DEBUG_INFO_REDUCED: disabled"
+          echo "ROOTFS: 10240 MB"
+          echo "VMDK_IMAGES: disabled"
 
-      # 下载编译所需源码包
+          echo "All configuration checks passed."
+
+
+      # ======================================================
+      # 下载 OpenWrt 编译所需源码包
+      #
+      # 使用 -j2：
+      #   降低 GitHub Runner 内存压力
+      #
+      # 同时保存 download.log：
+      #   如果后续失败可以通过 Artifact 查看
+      # ======================================================
+
       - name: Download packages
         working-directory: openwrt
         shell: bash
@@ -207,10 +380,36 @@ jobs:
 
           make download -j2 V=s 2>&1 | tee download.log
 
-      # 修改 OpenWrt 10GB RootFS 填充方式
-      # 官方 image.mk 使用 dd bs=10GB，在 GitHub Runner 上可能造成严重内存压力。
-      # 这里保持 CONFIG_TARGET_ROOTFS_PARTSIZE=10240 不变，
-      # 只将大块 dd 改成 cp + truncate，避免一次申请 10GB 内存。
+
+      # ======================================================
+      # 修改 OpenWrt 大尺寸 RootFS Padding
+      #
+      # OpenWrt 官方 image.mk 默认使用：
+      #
+      #   dd if=$(1) of=$(1).new bs=$(2) conv=sync
+      #
+      # 当 RootFS 设置为 10GB 时，
+      # bs 可能直接达到约 10GB。
+      #
+      # 在 GitHub Runner 上可能产生非常大的内存压力。
+      #
+      # 所以这里：
+      #
+      #   CONFIG_TARGET_ROOTFS_PARTSIZE
+      #       ↓
+      #     仍然是 10240 MB
+      #
+      # 只修改文件扩展方式：
+      #
+      #   cp
+      #   truncate
+      #
+      # 不改变最终镜像尺寸。
+      #
+      # 使用 start/end 定位，而不是依赖空格数量，
+      # 避免不同源码格式导致替换失败。
+      # ======================================================
+
       - name: Fix large rootfs padding
         working-directory: openwrt
         shell: bash
@@ -223,36 +422,70 @@ jobs:
           path = Path("include/image.mk")
           text = path.read_text()
 
-          old = """define Image/pad-to
-          dd if=$(1) of=$(1).new bs=$(2) conv=sync
-          mv $(1).new $(1)
-          endef"""
+          # 找到 Image/pad-to 的开始位置
 
-          new = """define Image/pad-to
-          @size=$$(stat -c %s $(1)); \\
-          test $$size -le $(2) || { echo "ERROR: image is larger than requested padding size"; exit 1; }; \\
-          cp $(1) $(1).new; \\
-          truncate -s $(2) $(1).new; \\
-          mv $(1).new $(1)
-          endef"""
+          start = text.find("define Image/pad-to")
 
-          if old not in text:
+          if start < 0:
               raise SystemExit(
-                  "错误：未找到预期的 Image/pad-to 代码，"
-                  "OpenWrt 源码结构可能已经发生变化。"
+                  "ERROR: Cannot find define Image/pad-to"
               )
 
-          path.write_text(text.replace(old, new, 1))
+          # 找到这个 define 对应的 endef
 
-          print("已修改 include/image.mk 的 Image/pad-to")
+          end = text.find("\nendef", start)
+
+          if end < 0:
+              raise SystemExit(
+                  "ERROR: Cannot find endef for Image/pad-to"
+              )
+
+          end += len("\nendef")
+
+          # 使用 Makefile recipe 所需的 TAB
+          # 不依赖原文件中的缩进空格数量
+
+          new_block = """define Image/pad-to
+          \t@size=$$(stat -c %s $(1)); \\
+          \ttest $$size -le $(2) || { echo "ERROR: image is larger than requested size"; exit 1; }; \\
+          \tcp $(1) $(1).new; \\
+          \ttruncate -s $(2) $(1).new; \\
+          \tmv $(1).new $(1)
+          endef"""
+
+          # 替换整个 Image/pad-to 区块
+
+          path.write_text(
+              text[:start]
+              + new_block
+              + text[end:]
+          )
+
+          print("Image/pad-to successfully modified.")
           PY
 
-          echo "========== 修改后的 Image/pad-to =========="
-          sed -n '/define Image\/pad-to/,/endef/p' include/image.mk
+          echo "========== MODIFIED Image/pad-to =========="
+
+          sed -n \
+            '/define Image\/pad-to/,/endef/p' \
+            include/image.mk
+
           echo "==========================================="
 
+
+      # ======================================================
       # 编译 OpenWrt
-      # 使用 -j2，避免 GitHub Runner 因并行编译造成过高内存压力
+      #
+      # 使用 -j2：
+      #   降低 GitHub Runner 因并行编译造成的内存压力
+      #
+      # V=s：
+      #   输出完整编译信息
+      #
+      # tee：
+      #   同时保存 build.log
+      # ======================================================
+
       - name: Build OpenWrt
         working-directory: openwrt
         shell: bash
@@ -261,14 +494,24 @@ jobs:
 
           make -j2 V=s 2>&1 | tee build.log
 
-      # 检查编译结果
+
+      # ======================================================
+      # 检查官方 x86_64 构建结果
+      #
+      # 我们需要的是：
+      #
+      #   *combined-efi.img.gz
+      #
+      # 后面由它转换为 VMDK。
+      # ======================================================
+
       - name: Verify build output
         working-directory: openwrt
         shell: bash
         run: |
           set -e
 
-          echo "========== x86_64 构建输出 =========="
+          echo "========== BUILD OUTPUT =========="
 
           find bin/targets/x86/64 \
             -maxdepth 1 \
@@ -285,13 +528,36 @@ jobs:
           )"
 
           if [ -z "$IMG" ]; then
-            echo "错误：没有找到 combined-efi.img.gz"
+            echo "ERROR: combined-efi.img.gz not found"
             exit 1
           fi
 
-          echo "找到官方 IMG：$IMG"
+          echo "Found official OpenWrt image:"
+          echo "$IMG"
 
+
+      # ======================================================
       # 将官方 combined-efi.img 转换为 VMDK
+      #
+      # 流程：
+      #
+      #   combined-efi.img.gz
+      #          ↓
+      #       gunzip
+      #          ↓
+      #       raw .img
+      #          ↓
+      #       qemu-img
+      #          ↓
+      #       .vmdk
+      #
+      # 不启用 CONFIG_VMDK_IMAGES。
+      #
+      # 不使用 streamOptimized。
+      #
+      # 不生成额外的 OpenWrt 原生 VMDK 文件。
+      # ======================================================
+
       - name: Convert IMG to VMDK
         working-directory: openwrt
         shell: bash
@@ -307,112 +573,22 @@ jobs:
           )"
 
           if [ -z "$IMG" ]; then
-            echo "错误：找不到 combined-efi.img.gz"
+            echo "ERROR: combined-efi.img.gz not found"
             exit 1
           fi
 
           mkdir -p release
 
-          gunzip -c "$IMG" > release/OpenWrt-x86_64-BTF-10G.img
+          # 解压官方 IMG
 
-          qemu-img convert \
-            -f raw \
-            -O vmdk \
-            release/OpenWrt-x86_64-BTF-10G.img \
-            release/OpenWrt-x86_64-BTF-10G.vmdk
+          gunzip -c \
+            "$IMG" \
+            > release/OpenWrt-x86_64-BTF-10G.img
 
-          rm -f release/OpenWrt-x86_64-BTF-10G.img
+          # 使用 qemu-img 转换为 VMDK
+          #
+          # 不指定 streamOptimized。
+          # 因此这里不是 VMware streamOptimized VMDK。
 
-          echo "========== VMDK 信息 =========="
-          qemu-img info release/OpenWrt-x86_64-BTF-10G.vmdk
-          echo "==============================="
-
-      # 对未压缩 VMDK 本体计算 SHA256
-      - name: Generate SHA256
-        working-directory: openwrt
-        shell: bash
-        run: |
-          set -e
-
-          cd release
-
-          sha256sum \
-            OpenWrt-x86_64-BTF-10G.vmdk \
-            > OpenWrt-x86_64-BTF-10G.vmdk.sha256
-
-          echo "========== SHA256 =========="
-          cat OpenWrt-x86_64-BTF-10G.vmdk.sha256
-          echo "============================"
-
-      # 创建最终 ZIP
-      # ZIP 只包含 VMDK 和 SHA256
-      - name: Create ZIP package
-        working-directory: openwrt
-        shell: bash
-        run: |
-          set -e
-
-          cd release
-
-          zip -9 \
-            OpenWrt-x86_64-BTF-10G.zip \
-            OpenWrt-x86_64-BTF-10G.vmdk \
-            OpenWrt-x86_64-BTF-10G.vmdk.sha256
-
-          echo "========== ZIP 内容 =========="
-          unzip -l OpenWrt-x86_64-BTF-10G.zip
-          echo "=============================="
-
-      # 显示最终文件
-      - name: Show release files
-        working-directory: openwrt
-        shell: bash
-        run: |
-          set -e
-
-          echo "========== Release 文件 =========="
-          ls -lh release/
-          echo "==================================="
-
-      # 构建失败时上传日志和配置
-      - name: Upload logs on failure
-        if: failure()
-        uses: actions/upload-artifact@v5
-        with:
-          name: openwrt-build-logs
-          path: |
-            openwrt/build.log
-            openwrt/download.log
-            openwrt/.config
-            openwrt/include/image.mk
-            openwrt/bin/targets/x86/64/
-          if-no-files-found: warn
-          retention-days: 7
-
-      # 创建 GitHub Release
-      # Release 只上传最终 ZIP
-      - name: Create GitHub Release
-        if: success()
-        uses: softprops/action-gh-release@v2
-        with:
-          tag_name: ${{ steps.release.outputs.version }}-btf-10g
-          name: OpenWrt ${{ steps.release.outputs.version }} x86_64 BTF 10G
-          body: |
-            OpenWrt 官方稳定版
-
-            版本：${{ steps.release.outputs.version }}
-
-            架构：x86_64
-
-            BTF：启用
-
-            RootFS：10GB
-
-            VMDK：由官方 combined-efi.img 转换
-
-            VMDK_IMAGES：未启用
-
-            SHA256：已提供
-          files: |
-            openwrt/release/OpenWrt-x86_64-BTF-10G.zip
+          qe
 ```
